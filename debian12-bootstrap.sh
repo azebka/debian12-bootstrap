@@ -52,6 +52,50 @@ restart_sshd_safely() {
   systemctl reload ssh || systemctl restart ssh
 }
 
+normalize_sshd_dropins() {
+  local dir="$1"
+  local skip_file="$2"
+  local disable_password_auth="$3"
+  local f tmp
+
+  shopt -s nullglob
+  for f in "$dir"/*.conf; do
+    [[ -f "$f" ]] || continue
+    [[ "$f" == "$skip_file" ]] && continue
+
+    tmp="${f}.tmp.$$"
+    if awk -v disable_password_auth="$disable_password_auth" '
+      BEGIN { changed=0 }
+      {
+        if ($0 !~ /^[[:space:]]*#/) {
+          if ($0 ~ /^[[:space:]]*PermitRootLogin([[:space:]]|$)/) {
+            print "PermitRootLogin no"
+            changed=1
+            next
+          }
+          if (disable_password_auth == "yes" && $0 ~ /^[[:space:]]*PasswordAuthentication([[:space:]]|$)/) {
+            print "PasswordAuthentication no"
+            changed=1
+            next
+          }
+          if (disable_password_auth == "yes" && $0 ~ /^[[:space:]]*KbdInteractiveAuthentication([[:space:]]|$)/) {
+            print "KbdInteractiveAuthentication no"
+            changed=1
+            next
+          }
+        }
+        print
+      }
+      END { exit changed ? 0 : 1 }
+    ' "$f" >"$tmp"; then
+      backup_file "$f"
+      cat "$tmp" >"$f"
+    fi
+    rm -f "$tmp"
+  done
+  shopt -u nullglob
+}
+
 # --- UI helpers ---
 msg() { whiptail --title "Debian 12 VPS Bootstrap" --msgbox "$1" 12 78; }
 yesno() { whiptail --title "Debian 12 VPS Bootstrap" --yesno "$1" 12 78; }
@@ -146,7 +190,7 @@ if yesno "Relax password policy (pwquality) BEFORE user/password actions?\n\nThi
 fi
 
 # Username
-USERNAME="$(inputbox "Enter the username (lowercase, e.g. 'az'):" "")"
+USERNAME="$(inputbox "Enter the username (lowercase, e.g. 'man'):" "")"
 USERNAME="$(echo "$USERNAME" | trim)"
 if ! is_valid_username "$USERNAME"; then
   msg "Invalid username.\n\nRules: starts with a lowercase letter, then lowercase letters/digits/_- (max 32 chars)."
@@ -257,6 +301,11 @@ fi
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSHD_DROPIN_FILE="$SSHD_DROPIN_DIR/99-bootstrap-hardening.conf"
 install -d -m 755 "$SSHD_DROPIN_DIR"
+
+# OpenSSH uses the first value it reads for many settings, so normalize
+# existing drop-ins before writing our own file.
+normalize_sshd_dropins "$SSHD_DROPIN_DIR" "$SSHD_DROPIN_FILE" "$DISABLE_PASSWORD_AUTH"
+
 backup_file "$SSHD_DROPIN_FILE"
 
 {
