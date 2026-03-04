@@ -9,6 +9,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
+ENABLE_BACKUPS="yes"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -39,6 +40,9 @@ is_valid_ssh_pubkey() {
 
 backup_file() {
   local f="$1"
+  if [[ "${ENABLE_BACKUPS:-yes}" != "yes" ]]; then
+    return 0
+  fi
   if [[ -f "$f" ]]; then
     cp -a "$f" "${f}.bak.$(date +%Y%m%d-%H%M%S)"
   fi
@@ -56,6 +60,7 @@ normalize_sshd_dropins() {
   local dir="$1"
   local skip_file="$2"
   local disable_password_auth="$3"
+  local permit_root_login="$4"
   local f tmp
 
   shopt -s nullglob
@@ -64,12 +69,12 @@ normalize_sshd_dropins() {
     [[ "$f" == "$skip_file" ]] && continue
 
     tmp="${f}.tmp.$$"
-    if awk -v disable_password_auth="$disable_password_auth" '
+    if awk -v disable_password_auth="$disable_password_auth" -v permit_root_login="$permit_root_login" '
       BEGIN { changed=0 }
       {
         if ($0 !~ /^[[:space:]]*#/) {
           if ($0 ~ /^[[:space:]]*PermitRootLogin([[:space:]]|$)/) {
-            print "PermitRootLogin no"
+            print "PermitRootLogin " permit_root_login
             changed=1
             next
           }
@@ -180,46 +185,69 @@ set_user_password() {
 # --- Main ---
 ensure_packages
 
-msg "This wizard will:\n\n- (Optionally) Relax password policy (pwquality)\n- Create/ensure a non-root sudo user\n- Set/change that user's password (optional)\n- Install your SSH public key\n- Disable SSH root login\n- Configure UFW firewall (optional Nginx)\n\nMake sure you can open a NEW SSH session after changes."
+msg "This wizard will:\n\n- (Optionally) Save timestamped config backups\n- Install your SSH public key for root or for a sudo user\n- Create/ensure a sudo user when selected\n- Set/change that user's password (optional)\n- Configure SSH login policy\n- Add UFW firewall rules (optional Nginx)\n\nMake sure you can open a NEW SSH session after changes."
 
 RELAX_PW="no"
-if yesno "Relax password policy (pwquality) BEFORE user/password actions?\n\nThis disables dictionary checks and lowers requirements system-wide.\nRecommended only for initial setup." ; then
-  RELAX_PW="yes"
-  apply_relaxed_pw_policy
-  msg "Relaxed password policy applied.\n\nNote: this is system-wide and stays until you revert /etc/security/pwquality.conf."
+
+if ! yesno "Save timestamped .bak backups before modifying config files?" ; then
+  ENABLE_BACKUPS="no"
 fi
 
-# Username
-USERNAME="$(inputbox "Enter the username (lowercase, e.g. 'man'):" "")"
-USERNAME="$(echo "$USERNAME" | trim)"
-if ! is_valid_username "$USERNAME"; then
-  msg "Invalid username.\n\nRules: starts with a lowercase letter, then lowercase letters/digits/_- (max 32 chars)."
-  exit 1
-fi
+SSH_TARGET_MODE="$(whiptail --title "Debian 12 VPS Bootstrap" --menu \
+"Where should the SSH key be installed?" 16 78 6 \
+"user" "Create/use a sudo user (recommended)" \
+"root" "Keep SSH access on root (key-only)" \
+3>&1 1>&2 2>&3)"
 
-USER_EXISTS="no"
-if id "$USERNAME" >/dev/null 2>&1; then
-  USER_EXISTS="yes"
-  msg "User '$USERNAME' already exists.\nThe script can update password, sudo, SSH key, SSH settings, firewall."
-fi
+SSH_LOGIN_USER=""
+TARGET_LABEL=""
+PERMIT_ROOT_LOGIN="no"
 
-# Create user if needed
-if [[ "$USER_EXISTS" == "no" ]]; then
-  useradd -m -s /bin/bash "$USERNAME"
-  msg "User '$USERNAME' created."
-fi
+case "$SSH_TARGET_MODE" in
+  root)
+    SSH_LOGIN_USER="root"
+    TARGET_LABEL="root"
+    PERMIT_ROOT_LOGIN="prohibit-password"
+    ;;
+  user|*)
+    if yesno "Relax password policy (pwquality) BEFORE user/password actions?\n\nThis disables dictionary checks and lowers requirements system-wide.\nRecommended only for initial setup." ; then
+      RELAX_PW="yes"
+      apply_relaxed_pw_policy
+      msg "Relaxed password policy applied.\n\nNote: this is system-wide and stays until you revert /etc/security/pwquality.conf."
+    fi
 
-# Password: allow setting/changing even if user exists
-if yesno "Do you want to set/change the password for '$USERNAME' now?" ; then
-  set_user_password "$USERNAME" || true
-else
-  msg "Skipping password setup.\n\nYou can set it later with:\n  sudo passwd $USERNAME"
-fi
+    USERNAME="$(inputbox "Enter the username (lowercase, e.g. 'man'):" "")"
+    USERNAME="$(echo "$USERNAME" | trim)"
+    if ! is_valid_username "$USERNAME"; then
+      msg "Invalid username.\n\nRules: starts with a lowercase letter, then lowercase letters/digits/_- (max 32 chars)."
+      exit 1
+    fi
 
-# Ensure sudo access
-usermod -aG sudo "$USERNAME"
-echo "%sudo ALL=(ALL:ALL) ALL" >/etc/sudoers.d/99-sudo-group
-chmod 0440 /etc/sudoers.d/99-sudo-group
+    USER_EXISTS="no"
+    if id "$USERNAME" >/dev/null 2>&1; then
+      USER_EXISTS="yes"
+      msg "User '$USERNAME' already exists.\nThe script can update password, sudo, SSH key, SSH settings, firewall."
+    fi
+
+    if [[ "$USER_EXISTS" == "no" ]]; then
+      useradd -m -s /bin/bash "$USERNAME"
+      msg "User '$USERNAME' created."
+    fi
+
+    if yesno "Do you want to set/change the password for '$USERNAME' now?" ; then
+      set_user_password "$USERNAME" || true
+    else
+      msg "Skipping password setup.\n\nYou can set it later with:\n  sudo passwd $USERNAME"
+    fi
+
+    usermod -aG sudo "$USERNAME"
+    echo "%sudo ALL=(ALL:ALL) ALL" >/etc/sudoers.d/99-sudo-group
+    chmod 0440 /etc/sudoers.d/99-sudo-group
+
+    SSH_LOGIN_USER="$USERNAME"
+    TARGET_LABEL="$USERNAME (sudo)"
+    ;;
+esac
 
 # SSH public key input method
 KEY_INPUT_METHOD="$(whiptail --title "Debian 12 VPS Bootstrap" --menu \
@@ -255,13 +283,13 @@ if ! is_valid_ssh_pubkey "$SSH_PUBKEY"; then
 fi
 
 # Install key
-USER_HOME="$(getent passwd "$USERNAME" | cut -d: -f6)"
+USER_HOME="$(getent passwd "$SSH_LOGIN_USER" | cut -d: -f6)"
 SSH_DIR="$USER_HOME/.ssh"
 AUTH_KEYS="$SSH_DIR/authorized_keys"
 
-install -d -m 700 -o "$USERNAME" -g "$USERNAME" "$SSH_DIR"
+install -d -m 700 -o "$SSH_LOGIN_USER" -g "$SSH_LOGIN_USER" "$SSH_DIR"
 touch "$AUTH_KEYS"
-chown "$USERNAME:$USERNAME" "$AUTH_KEYS"
+chown "$SSH_LOGIN_USER:$SSH_LOGIN_USER" "$AUTH_KEYS"
 chmod 600 "$AUTH_KEYS"
 
 if ! grep -Fqx "$SSH_PUBKEY" "$AUTH_KEYS"; then
@@ -291,7 +319,7 @@ if yesno "Allow Nginx (HTTP/HTTPS: 80 & 443) in firewall?" ; then
 fi
 
 # Summary
-SUMMARY="Summary:\n\nRelax password policy: $RELAX_PW\nUser: $USERNAME (sudo)\nSSH key installed: yes\nSSH port: $SSH_PORT\nDisable root SSH login: yes\nDisable SSH password auth: $DISABLE_PASSWORD_AUTH\nAllow Nginx in firewall: $ALLOW_NGINX\nFirewall: UFW enable\n\nProceed?"
+SUMMARY="Summary:\n\nSave backups: $ENABLE_BACKUPS\nRelax password policy: $RELAX_PW\nSSH target: $TARGET_LABEL\nSSH key installed: yes\nPermitRootLogin: $PERMIT_ROOT_LOGIN\nSSH port: $SSH_PORT\nDisable SSH password auth: $DISABLE_PASSWORD_AUTH\nAllow Nginx in firewall: $ALLOW_NGINX\nFirewall: add UFW rules (enable if inactive)\n\nProceed?"
 if ! whiptail --title "Debian 12 VPS Bootstrap" --yesno "$SUMMARY" 18 78; then
   msg "Cancelled.\nNo SSH/firewall changes were applied."
   exit 0
@@ -304,13 +332,13 @@ install -d -m 755 "$SSHD_DROPIN_DIR"
 
 # OpenSSH uses the first value it reads for many settings, so normalize
 # existing drop-ins before writing our own file.
-normalize_sshd_dropins "$SSHD_DROPIN_DIR" "$SSHD_DROPIN_FILE" "$DISABLE_PASSWORD_AUTH"
+normalize_sshd_dropins "$SSHD_DROPIN_DIR" "$SSHD_DROPIN_FILE" "$DISABLE_PASSWORD_AUTH" "$PERMIT_ROOT_LOGIN"
 
 backup_file "$SSHD_DROPIN_FILE"
 
 {
   echo "# Managed by debian12-bootstrap.sh"
-  echo "PermitRootLogin no"
+  echo "PermitRootLogin $PERMIT_ROOT_LOGIN"
   echo "PubkeyAuthentication yes"
   if [[ "$DISABLE_PASSWORD_AUTH" == "yes" ]]; then
     echo "PasswordAuthentication no"
@@ -328,11 +356,6 @@ if ! restart_sshd_safely; then
 fi
 
 # Configure UFW
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-
-# SSH
 ufw allow "${SSH_PORT}/tcp"
 
 # Nginx (HTTP/HTTPS)
@@ -340,8 +363,20 @@ if [[ "$ALLOW_NGINX" == "yes" ]]; then
   ufw allow 'Nginx Full'
 fi
 
-ufw --force enable
+if ! ufw status | grep -qi '^Status: active'; then
+  ufw --force enable
+fi
 
-msg "Done.\n\nNEXT STEPS:\n1) Open a NEW terminal.\n2) SSH as: $USERNAME\n   ssh -p $SSH_PORT $USERNAME@YOUR_SERVER_IP\n3) Confirm sudo works: sudo -v\n\nRoot SSH login is disabled."
+NEXT_STEP_CMD="3) Confirm access works."
+if [[ "$SSH_LOGIN_USER" != "root" ]]; then
+  NEXT_STEP_CMD="3) Confirm sudo works: sudo -v"
+fi
+
+ROOT_STATUS_MSG="Root SSH login is disabled."
+if [[ "$PERMIT_ROOT_LOGIN" != "no" ]]; then
+  ROOT_STATUS_MSG="Root SSH login is allowed with SSH keys only."
+fi
+
+msg "Done.\n\nNEXT STEPS:\n1) Open a NEW terminal.\n2) SSH as: $SSH_LOGIN_USER\n   ssh -p $SSH_PORT $SSH_LOGIN_USER@YOUR_SERVER_IP\n$NEXT_STEP_CMD\n\n$ROOT_STATUS_MSG"
 
 echo "All done."
