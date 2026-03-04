@@ -360,7 +360,8 @@ ufw allow "${SSH_PORT}/tcp"
 
 # Nginx (HTTP/HTTPS)
 if [[ "$ALLOW_NGINX" == "yes" ]]; then
-  ufw allow 'Nginx Full'
+  ufw allow 80/tcp
+  ufw allow 443/tcp
 fi
 
 if ! ufw status | grep -qi '^Status: active'; then

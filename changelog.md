@@ -6,3 +6,4 @@
 - Added a menu to choose where the SSH key is installed: `root` (key-only root login) or a sudo user (create or reuse a non-root account).
 - Added an option to disable timestamped `.bak.YYYYMMDD-HHMMSS` backups for config files during the current run.
 - Changed UFW handling to add allow-rules without `ufw --force reset`; the script now enables UFW only when it is inactive.
+- Replaced the `Nginx Full` UFW application profile with explicit `80/tcp` and `443/tcp` rules, so the script works even when that profile is unavailable.
